@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+data/daily_snapshot_cache.json
+.DS_Store
