@@ -123,8 +123,9 @@ st.markdown(
     <div class="rfp-hero">
         {'<img src="data:image/png;base64,' + _logo_b64 + '" style="height:56px;margin-bottom:0.4rem;">' if _logo_b64 else ''}
         <div>
-        <span class="rfp-badge">PG&E Natural Gas Service Provider</span>
-        <span class="rfp-badge">SoCalGas Non-Core Agent</span>
+        <span class="rfp-badge">PG&E</span>
+        <span class="rfp-badge">SoCal</span>
+        <span class="rfp-badge">SoCal</span>
         </div>
         <h1>Know What Your Natural Gas Should Cost</h1>
         <p>Live NYMEX futures plus live forward basis — the market-based part of your price, built fresh
