@@ -1,4 +1,11 @@
 __pycache__/
 *.pyc
-data/daily_snapshot_cache.json
 .DS_Store
+venv/
+.venv/
+
+# NEVER commit these (the repo is public):
+.streamlit/secrets.toml
+data/leads_backup.csv
+data/daily_snapshot_cache.json
+out/
