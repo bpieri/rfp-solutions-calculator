@@ -1,0 +1,68 @@
+name: Weekly quote (build the Monday email)
+
+# Manual: GitHub -> Actions -> "Weekly quote" -> Run workflow.
+# Type this week's market note, click run, then download the "weekly-quote"
+# artifact (HTML + text + subject lines) and paste into a systeme.io newsletter.
+
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: "What moved the market (2-4 sentences; use || between paragraphs)"
+        required: false
+        default: ""
+      daily_url:
+        description: "Link to the latest RFP daily update (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore week-over-week state
+        run: |
+          mkdir -p out
+          git fetch --depth=1 origin +weekly-data:refs/remotes/origin/weekly-data || true
+          git show origin/weekly-data:weekly_state.json > out/weekly_state.json 2>/dev/null || echo "no state yet (first run)"
+
+      - name: Build the email
+        env:
+          WEEKLY_NOTE: ${{ github.event.inputs.note }}
+          DAILY_NEWSLETTER_URL: ${{ github.event.inputs.daily_url }}
+          COMPANY_ADDRESS: ${{ vars.COMPANY_ADDRESS }}
+          LOGO_URL: ${{ vars.LOGO_URL }}
+          CALCULATOR_URL: ${{ vars.CALCULATOR_URL }}
+          STATE_PATH: out/weekly_state.json
+          OUT_DIR: out/weekly
+        run: python scripts/weekly_quote.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: weekly-quote
+          path: out/weekly/
+
+      - name: Save week-over-week state
+        run: |
+          mkdir -p /tmp/publish && cp out/weekly_state.json /tmp/publish/
+          git config user.name "rfp-weekly-bot"
+          git config user.email "rfp-weekly-bot@users.noreply.github.com"
+          git checkout --orphan weekly-publish
+          git rm -rf . > /dev/null 2>&1 || true
+          cp /tmp/publish/weekly_state.json .
+          git add weekly_state.json
+          git commit -m "weekly state $(date -u +%F)"
+          git push --force origin HEAD:weekly-data
