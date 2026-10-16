@@ -1,0 +1,58 @@
+name: Market snapshot (live numbers for the landing page)
+
+# Every 30 minutes: pull the forward basis feed + live NYMEX, write
+# market_snapshot.json, and publish it to the `snapshot-data` branch.
+# The landing page reads it from:
+#   https://raw.githubusercontent.com/<owner>/<repo>/snapshot-data/market_snapshot.json
+# It publishes to a SEPARATE branch on purpose: pushing to `main` would
+# redeploy the Streamlit calculator every 30 minutes.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: market-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install pandas requests yfinance
+
+      - name: Restore previous history (for day-over-day deltas)
+        run: |
+          mkdir -p out
+          git fetch --depth=1 origin +snapshot-data:refs/remotes/origin/snapshot-data || true
+          git show origin/snapshot-data:market_snapshot_history.json > out/market_snapshot_history.json 2>/dev/null || echo "no history yet (first run)"
+
+      - name: Build snapshot
+        env:
+          OUTPUT_PATH: out/market_snapshot.json
+          HISTORY_PATH: out/market_snapshot_history.json
+        run: python scripts/market_snapshot.py
+
+      - name: Publish to snapshot-data branch
+        run: |
+          mkdir -p /tmp/publish && cp out/market_snapshot.json out/market_snapshot_history.json /tmp/publish/
+          git config user.name "rfp-snapshot-bot"
+          git config user.email "rfp-snapshot-bot@users.noreply.github.com"
+          git checkout --orphan snapshot-publish
+          git rm -rf . > /dev/null 2>&1 || true
+          cp /tmp/publish/*.json .
+          git add market_snapshot.json market_snapshot_history.json
+          git commit -m "snapshot $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push --force origin HEAD:snapshot-data
