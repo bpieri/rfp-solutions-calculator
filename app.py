@@ -1,5 +1,7 @@
 import base64
 import datetime as dt
+import hmac
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -10,6 +12,18 @@ from utils.tariffs import SOCALGAS_CORE_G10, PGE_GNR1, wacog_premium_dollars_per
 from utils.basis_data import get_basis_forward_curve, TICKER_LABELS, LIVE_BASIS_URL
 from utils.nymex_data import build_nymex_forward_curve
 from utils.daily_snapshot import record_and_get_prior_close
+from utils.leads import (
+    TAG_QUOTE_REQUESTED, get_secret, is_valid_email, make_token, submit_lead,
+    tag_contact_by_email, verify_token,
+)
+
+BOOKING_URL = "https://cal.com/sean-dookie-geygqi/30min"
+
+
+def _safe_eq(a: str, b: str) -> bool:
+    """Constant-time string compare that never crashes on non-ASCII input."""
+    return hmac.compare_digest(str(a).encode("utf-8"), str(b).encode("utf-8"))
+
 
 # ---------------------------------------------------------------------------
 # Page config + dark theming
@@ -100,6 +114,15 @@ st.markdown(
             color: white;
         }}
         .rfp-cta-banner b {{ color: white; }}
+        /* buttons: gold primary with navy text; quiet outlined secondary */
+        [data-testid^="stBaseButton-primary"], [data-testid^="stBaseLinkButton-primary"] {{
+            background-color: {GOLD} !important; border: none !important; }}
+        [data-testid^="stBaseButton-primary"] p, [data-testid^="stBaseLinkButton-primary"] p {{
+            color: {NAVY} !important; font-weight: 700 !important; }}
+        [data-testid^="stBaseButton-secondary"], [data-testid^="stBaseLinkButton-secondary"] {{
+            background-color: transparent !important; border: 1px solid {SUBTEXT} !important; }}
+        [data-testid^="stBaseButton-secondary"] p, [data-testid^="stBaseLinkButton-secondary"] p {{
+            color: {TEXT} !important; }}
         .rfp-pending {{
             background: rgba(143,163,196,0.08); border: 1px dashed {SUBTEXT};
             border-radius: 14px; padding: 1.3rem 1.6rem; margin: 1.2rem 0;
@@ -118,23 +141,29 @@ UTILITY_OPTIONS = {
 # ---------------------------------------------------------------------------
 # Hero
 # ---------------------------------------------------------------------------
-st.markdown(
-    f"""
-    <div class="rfp-hero">
-        {'<img src="data:image/png;base64,' + _logo_b64 + '" style="height:56px;margin-bottom:0.4rem;">' if _logo_b64 else ''}
-        <div>
-        <span class="rfp-badge">PG&E</span>
-        <span class="rfp-badge">SoCal</span>
-        <span class="rfp-badge">SoCal</span>
+# When shown inside the systeme.io page (?view=embed) the page already has the logo and headline,
+# so the hero card is skipped there.
+# (Streamlit reserves its own ?embed=true and hides it from the app, so we use our own ?view=embed flag.)
+EMBEDDED = str(st.query_params.get("view", "")).lower() == "embed"
+
+if not EMBEDDED:
+    st.markdown(
+        f"""
+        <div class="rfp-hero">
+            {'<img src="data:image/png;base64,' + _logo_b64 + '" style="height:56px;margin-bottom:0.4rem;">' if _logo_b64 else ''}
+            <div>
+            <span class="rfp-badge">PG&E</span>
+            <span class="rfp-badge">SoCal</span>
+            <span class="rfp-badge">Piedmont</span>
+            </div>
+            <h1>Know What Your Natural Gas Should Cost</h1>
+            <p>Live NYMEX futures plus live forward basis — the market-based part of your price, built fresh
+            every day. Everything else (transportation, delivery, and the rest) is different for every account,
+            so get your real number from RFP.</p>
         </div>
-        <h1>Know What Your Natural Gas Should Cost</h1>
-        <p>Live NYMEX futures plus live forward basis — the market-based part of your price, built fresh
-        every day. Everything else (transportation, delivery, and the rest) is different for every account,
-        so get your real number from RFP.</p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ---------------------------------------------------------------------------
 # THE ONE TRIGGER: citygate dropdown drives everything below
@@ -289,6 +318,138 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ---------------------------------------------------------------------------
+# ACCESS GATE -- a free taste above this line, the full calculator below it.
+#   * Everything above (inputs, live NYMEX/basis, Buyer Signal) is the "tease".
+#   TWO MODES (chosen automatically by which secrets are set):
+#   PASSWORD MODE  (ACCESS_PASSWORD set)  -- systeme.io owns sign-up. Members get a link
+#       with ?pw=<password> (or type it). Visitors without it see a lock screen with a
+#       "Get free access" button to OPTIN_URL. Checked server-side: nothing gated is sent
+#       to the browser until it passes. No systeme.io API key needed.
+#   EMAIL MODE     (no ACCESS_PASSWORD)   -- the in-app email form creates the contact in
+#       systeme.io through its API (needs SYSTEMEIO_API_KEY). Fails OPEN if the API is down.
+#   Always available:  ?admin=<ADMIN_KEY> demo bypass (no lead).  ?k=<token> signed return
+#   link (email mode).  ?src=<name> traffic source (email mode).
+# ---------------------------------------------------------------------------
+GATE_SECRET = get_secret("GATE_SECRET")
+ADMIN_KEY = get_secret("ADMIN_KEY")
+ACCESS_PASSWORD = get_secret("ACCESS_PASSWORD").strip()
+OPTIN_URL = get_secret("OPTIN_URL").strip()
+PASSWORD_MODE = bool(ACCESS_PASSWORD)
+lead_source = str(st.query_params.get("src", "direct"))[:40]
+
+if not st.session_state.get("unlocked"):
+    _token = st.query_params.get("k")
+    _admin = st.query_params.get("admin")
+    _pw = st.query_params.get("pw")
+    _token_email = verify_token(str(_token), GATE_SECRET) if _token else None
+    if _token_email:
+        st.session_state.update(unlocked=True, lead_email=_token_email)
+    elif ADMIN_KEY and _admin and _safe_eq(_admin, ADMIN_KEY):
+        st.session_state.update(unlocked=True, lead_email="")
+    elif PASSWORD_MODE and _pw and _safe_eq(str(_pw).strip(), ACCESS_PASSWORD):
+        st.session_state.update(unlocked=True, lead_email="")
+
+if PASSWORD_MODE and not st.session_state.get("unlocked"):
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader(f"🔒 Your {fixed_term_months}-Month Price — {utility_key}")
+    p1, p2, p3 = st.columns(3)
+    for col, label in ((p1, f"NYMEX (avg, {fixed_term_months}-mo)"), (p2, "+ Basis (avg)"), (p3, "= Total")):
+        col.markdown(
+            f'''<div class="rfp-card"><div class="rfp-stat" style="filter:blur(8px);user-select:none;">$8.888<span style="font-size:1rem;">/Dth</span></div>
+            <div class="rfp-stat-label">{label}</div></div>''', unsafe_allow_html=True)
+    st.markdown(
+        f'''
+        <div class="rfp-signal-card">
+            <div style="font-size:1.25rem; font-weight:800; color:{GOLD}; margin-bottom:0.4rem;">
+                Free for RFP list members.</div>
+            <div style="color:{TEXT}; font-size:0.95rem; line-height:1.55;">
+                Sign up free and you'll get, instantly:<br>
+                &bull; Your {fixed_term_months}-month <b>{utility_key}</b> price, built from live NYMEX + basis<br>
+                &bull; Forward strips (6/12/24-month, winter/summer, calendar years)<br>
+                &bull; The &ldquo;Your Price vs. the utility&rdquo; chart<br>
+                &bull; RFP's Weekly Quote by email
+            </div>
+        </div>''', unsafe_allow_html=True)
+    if OPTIN_URL:
+        st.link_button("Get free access  →", OPTIN_URL, type="primary")
+    st.markdown("**Already a member?** Enter your member password:")
+    _fails = st.session_state.get("pw_fails", 0)
+    if _fails >= 5:
+        st.error("Too many incorrect attempts. Please use the link on your welcome page, or sign up again above.")
+    else:
+        with st.form("pw_form"):
+            _pw_in = st.text_input("Member password", type="password")
+            _pw_go = st.form_submit_button("Unlock")
+        if _pw_go:
+            if _safe_eq(_pw_in.strip(), ACCESS_PASSWORD):
+                st.session_state.update(unlocked=True, lead_email="")
+                st.rerun()
+            else:
+                st.session_state["pw_fails"] = _fails + 1
+                time.sleep(1)
+                if st.session_state["pw_fails"] >= 5:
+                    st.rerun()  # re-render immediately in the locked-out state
+                st.error("That password isn't right. It's on your welcome page.")
+    st.stop()
+
+if not st.session_state.get("unlocked"):
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.subheader(f"🔒 Your {fixed_term_months}-Month Price — {utility_key}")
+    p1, p2, p3 = st.columns(3)
+    for col, label in ((p1, f"NYMEX (avg, {fixed_term_months}-mo)"), (p2, "+ Basis (avg)"), (p3, "= Total")):
+        col.markdown(
+            f'''<div class="rfp-card"><div class="rfp-stat" style="filter:blur(8px);user-select:none;">$8.888<span style="font-size:1rem;">/Dth</span></div>
+            <div class="rfp-stat-label">{label}</div></div>''', unsafe_allow_html=True)
+
+    st.markdown(
+        f'''
+        <div class="rfp-signal-card">
+            <div style="font-size:1.25rem; font-weight:800; color:{GOLD}; margin-bottom:0.4rem;">
+                Unlock your number — free, 10 seconds.</div>
+            <div style="color:{TEXT}; font-size:0.95rem; line-height:1.55;">
+                You'll get, instantly:<br>
+                &bull; Your {fixed_term_months}-month <b>{utility_key}</b> price, built from live NYMEX + basis<br>
+                &bull; Forward strips (6/12/24-month, winter/summer, calendar years)<br>
+                &bull; The &ldquo;Your Price vs. the utility&rdquo; chart<br>
+                &bull; Then every Monday: your indicative quote, the basis, and what moved the market
+            </div>
+        </div>''', unsafe_allow_html=True)
+
+    with st.form("gate_form"):
+        g1, g2 = st.columns(2)
+        gate_first = g1.text_input("First name")
+        gate_email = g2.text_input("Work email")
+        gate_company = st.text_input("Company (optional)")
+        gate_daily = st.checkbox("Also send me RFP's daily market newsletter", value=True)
+        gate_go = st.form_submit_button("Unlock my price  →", type="primary")
+    st.caption(
+        "By continuing you'll receive RFP's weekly indicative quote (and the daily newsletter if checked). "
+        "Unsubscribe anytime. We never sell or share your email."
+    )
+    if gate_go:
+        if not is_valid_email(gate_email):
+            st.error("Please enter a valid email address.")
+        elif not gate_first.strip():
+            st.error("Please add your first name so we can personalize your weekly quote.")
+        else:
+            _result = submit_lead(
+                gate_email, first_name=gate_first.strip(), company=gate_company.strip(),
+                citygate=utility_key, monthly_dth=monthly_dth, term_months=fixed_term_months,
+                source=lead_source, daily_optin=gate_daily,
+            )
+            print(f"[gate] lead captured mode={_result.get('mode')} ok={_result.get('ok')}")
+            st.session_state.update(unlocked=True, lead_email=gate_email.strip().lower(), just_unlocked=True)
+            if GATE_SECRET:
+                st.query_params["k"] = make_token(gate_email, GATE_SECRET)
+            st.rerun()
+    st.stop()
+
+if st.session_state.pop("just_unlocked", False):
+    st.success("✅ You're in. Your weekly quote starts Monday. Bookmark this page — the link is personal "
+               "and keeps you signed in.")
+
+
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
@@ -337,27 +498,31 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with st.expander("📩 Get my real, live quote from RFP", expanded=False):
-    st.markdown(f"""
-    **Already carrying forward what you've entered:** {utility_key}, {monthly_dth:,} Dth/mo,
-    {fixed_term_months}-month term — RFP gets a qualified, usage-sized lead, not just an email address.
-
-    **What you'll get weekly, by email:**
-    - Your indicative price, recalculated for your citygate and usage
-    - Front-month basis for SoCal Citygate, PG&E Citygate, and Transco Zone 5
-    - A short note on what actually moved the basis that week
-    - RFP's daily market newsletter
-    """)
-    with st.form("lead_form"):
-        name = st.text_input("Name")
-        email = st.text_input("Work email")
-        company = st.text_input("Company")
-        newsletter_optin = st.checkbox("Also send me RFP's daily market newsletter", value=True)
-        submitted = st.form_submit_button("Request my real quote")
-        if submitted:
-            st.success(f"Thanks {name or 'there'} — in production this posts to the systeme.io funnel "
-                       f"with your {utility_key} / {monthly_dth:,} Dth/mo details attached, and "
-                       f"triggers the nurture sequence + a booked-meeting link.")
+st.subheader("Want the real number?")
+_lead_email = st.session_state.get("lead_email", "")
+_api_ready = bool(get_secret("SYSTEMEIO_API_KEY"))
+if st.session_state.get("quote_requested"):
+    st.success(f"Got it. RFP will follow up with your live {fixed_term_months}-month {utility_key} quote. "
+               "Want to move faster? Pick a time that works:")
+    st.link_button("Book a 15-minute review", BOOKING_URL)
+elif _lead_email or _api_ready:
+    q1, q2 = st.columns(2)
+    _req_email = _lead_email
+    if not _lead_email:  # password-mode member: ask for the email once, only when they want a quote
+        _req_email = q1.text_input("Your work email", key="req_email").strip().lower()
+    if q1.button("Request my real, live quote", type="primary"):
+        if not is_valid_email(_req_email):
+            q1.error("Please enter a valid email address.")
+        else:
+            tag_contact_by_email(
+                _req_email, TAG_QUOTE_REQUESTED,
+                fields={"citygate": utility_key, "monthly_dth": monthly_dth, "term_months": fixed_term_months},
+            )
+            st.session_state["quote_requested"] = True
+            st.rerun()
+    q2.link_button("Book a 15-minute review", BOOKING_URL)
+else:
+    st.link_button("Book a 15-minute review", BOOKING_URL)
 
 st.markdown("---")
 
@@ -532,6 +697,8 @@ st.caption(
     "Solutions for your real, live number."
 )
 
+
+
 # import base64
 # import datetime as dt
 # from pathlib import Path
@@ -540,15 +707,7 @@ st.caption(
 # import plotly.graph_objects as go
 # import streamlit as st
 
-# from utils.tariffs import (
-#     SOCALGAS_CORE_G10,
-#     PGE_GNR1,
-#     bracketed_cost,
-#     pge_transport_only_cost,
-#     local_delivery_dollars_per_therm,
-#     season_for_month,
-#     wacog_premium_dollars_per_therm,
-# )
+# from utils.tariffs import SOCALGAS_CORE_G10, PGE_GNR1, wacog_premium_dollars_per_therm
 # from utils.basis_data import get_basis_forward_curve, TICKER_LABELS, LIVE_BASIS_URL
 # from utils.nymex_data import build_nymex_forward_curve
 # from utils.daily_snapshot import record_and_get_prior_close
@@ -562,8 +721,8 @@ st.caption(
 #     layout="wide",
 # )
 
-# NAVY = "#0B1E3D"          # page background
-# CARD = "#132A50"          # card background (one step lighter than page)
+# NAVY = "#0B1E3D"
+# CARD = "#132A50"
 # CARD_BORDER = "rgba(255,255,255,0.08)"
 # GOLD = "#F2C94C"
 # GREEN = "#2ECC71"
@@ -578,17 +737,8 @@ st.caption(
 
 
 # def dark_chart_layout(**overrides) -> dict:
-#     """
-#     Shared Plotly dark-theme layout: sets font, axis line/tick/grid colors
-#     and legend text color explicitly, since `font_color` alone at the layout
-#     level does not reliably cascade to every axis/legend sub-element in
-#     Plotly -- leaving gridlines and tick labels at their light-mode default
-#     (dark grey), which is invisible against a dark navy background.
-
-#     Nested keys (xaxis, yaxis, legend) are merged with the dark-theme
-#     defaults rather than replaced, so a caller can add e.g.
-#     legend=dict(orientation="h") without losing the legend font color.
-#     """
+#     """Shared Plotly dark-theme layout -- see prior versions for why this exists
+#     (font_color alone doesn't cascade to axis/legend sub-elements in Plotly)."""
 #     base = {
 #         "plot_bgcolor": CARD,
 #         "paper_bgcolor": NAVY,
@@ -637,11 +787,9 @@ st.caption(
 #             border: 1px solid {CARD_BORDER};
 #         }}
 #         .rfp-card.plus {{ border-left: 3px solid {CYAN}; }}
-#         .rfp-card.opaque {{ border: 1px dashed {ORANGE}; background: rgba(230,126,34,0.08); }}
 #         .rfp-card.total {{ border: 2px solid {GOLD}; background: rgba(242,201,76,0.08); }}
 #         .rfp-stat {{ font-size: 1.9rem; font-weight:800; color:{TEXT}; }}
 #         .rfp-stat-label {{ color:{SUBTEXT}; font-size:0.85rem; }}
-#         .source-note {{ color:{SUBTEXT}; font-size:0.78rem; }}
 #         .rfp-signal-card {{
 #             background: linear-gradient(135deg, {CARD} 0%, #0E2244 100%);
 #             border-radius: 14px; padding: 1.4rem 1.6rem; margin-bottom: 1.5rem;
@@ -653,17 +801,19 @@ st.caption(
 #             color: white;
 #         }}
 #         .rfp-cta-banner b {{ color: white; }}
+#         .rfp-pending {{
+#             background: rgba(143,163,196,0.08); border: 1px dashed {SUBTEXT};
+#             border-radius: 14px; padding: 1.3rem 1.6rem; margin: 1.2rem 0;
+#         }}
 #     </style>
 #     """,
 #     unsafe_allow_html=True,
 # )
 
-# TAXES_DEFAULT_PER_DTH = 0.25      # $/Dth -- RFP's own example figure
-# ADVISORY_FEE_DEFAULT_PER_DTH = 0.25  # $/Dth -- RFP's anticipated advisory fee, part of the opaque bucket
-
 # UTILITY_OPTIONS = {
 #     "SoCalGas — SoCal Citygate": {"ticker": "SCB", "utility_key": "SoCalGas"},
 #     "PG&E — PG&E Citygate": {"ticker": "PGE", "utility_key": "PG&E"},
+#     "Piedmont — Transco Zone 5": {"ticker": "DKR", "utility_key": "Piedmont"},
 # }
 
 # # ---------------------------------------------------------------------------
@@ -674,21 +824,23 @@ st.caption(
 #     <div class="rfp-hero">
 #         {'<img src="data:image/png;base64,' + _logo_b64 + '" style="height:56px;margin-bottom:0.4rem;">' if _logo_b64 else ''}
 #         <div>
-#         <span class="rfp-badge">PG&E Natural Gas Service Provider</span>
-#         <span class="rfp-badge">SoCalGas Non-Core Agent</span>
+#         <span class="rfp-badge">PG&E</span>
+#         <span class="rfp-badge">SoCal</span>
+#         <span class="rfp-badge">SoCal</span>
 #         </div>
 #         <h1>Know What Your Natural Gas Should Cost</h1>
-#         <p>See an indicative fixed price built from live NYMEX futures, live forward basis, and your utility's
-#         own published tariff — then connect with RFP for the real, guaranteed number.</p>
+#         <p>Live NYMEX futures plus live forward basis — the market-based part of your price, built fresh
+#         every day. Everything else (transportation, delivery, and the rest) is different for every account,
+#         so get your real number from RFP.</p>
 #     </div>
 #     """,
 #     unsafe_allow_html=True,
 # )
 
 # # ---------------------------------------------------------------------------
-# # THE ONE TRIGGER: utility/citygate dropdown drives everything below
+# # THE ONE TRIGGER: citygate dropdown drives everything below
 # # ---------------------------------------------------------------------------
-# st.header("Indicative Fixed Price Calculator")
+# st.header("NYMEX + Basis Calculator")
 # top_col1, top_col2, top_col3 = st.columns([1.3, 1, 1])
 # with top_col1:
 #     utility_label = st.selectbox("Your citygate", list(UTILITY_OPTIONS.keys()))
@@ -697,29 +849,11 @@ st.caption(
 #                                    help="1 Dth ≈ 1 MMBtu ≈ 10 therms.")
 # with top_col3:
 #     fixed_term_months = st.selectbox("Fixed price term", [6, 12, 24], index=1,
-#                                       help="How many forward months to average into your indicative fixed price.")
-
-# # Internal-only: the underlying utility tariffs are published in $/therm, so
-# # this converts the Dth input for those calls. Never shown to the user --
-# # every number on screen is in Dth.
-# monthly_therms = monthly_dth * 10
+#                                       help="How many forward months to average into your indicative price.")
 
 # utility_choice = UTILITY_OPTIONS[utility_label]
 # ticker = utility_choice["ticker"]
 # utility_key = utility_choice["utility_key"]
-
-# with st.expander("⚙️ Assumptions behind the estimated Local Delivery, Advisory & Taxes (adjust freely)"):
-#     st.caption(
-#         "These three vary by your specific account, meter, and contract terms — RFP combines them into a "
-#         "single estimate here rather than pretending to know your exact number. Set in $/Dth, matching "
-#         "standard natural gas marketer convention."
-#     )
-#     advisory_fee_per_dth = st.slider("RFP Advisory Fee ($/Dth)", min_value=0.0, max_value=1.50,
-#                                       value=ADVISORY_FEE_DEFAULT_PER_DTH, step=0.05,
-#                                       help="Covers procurement strategy, market intelligence, and the senior-level "
-#                                            "relationship — not a generic markup.")
-#     taxes_per_dth = st.slider("Taxes & Regulatory Fees ($/Dth)", min_value=0.0, max_value=1.00,
-#                                value=TAXES_DEFAULT_PER_DTH, step=0.05)
 
 # # ---------------------------------------------------------------------------
 # # Pull live data: forward basis (Rogue Basis feed) -> forward NYMEX (yfinance)
@@ -734,29 +868,26 @@ st.caption(
 # curve, nymex_fetched_at = build_nymex_forward_curve(basis_curve)
 # curve = curve.sort_values("contract_date").reset_index(drop=True)
 
-# # NYMEX/basis from the data feed are natively $/MMBtu, which we treat as
-# # equal to $/Dth throughout this calculator (standard gas-industry
-# # convention). The utility's own published Cost of Gas, used to measure the
-# # WACOG premium, is $/therm-native -- that one internal helper stays in
-# # therms for the comparison to be apples-to-apples, then gets converted to
-# # Dth immediately below for everything downstream.
-# front_month_commodity_per_therm = (curve.iloc[0]["nymex_price"] + curve.iloc[0]["basis"]) / 10.0
+# # NYMEX/basis are natively $/MMBtu, treated as $/Dth throughout (standard
+# # gas-industry convention). front_month_commodity_per_therm is an internal-
+# # only helper (divided by 10) purely so the WACOG comparison lines up with
+# # the utility's own $/therm-native published Cost of Gas figure.
+# front_month_commodity_per_dth = curve.iloc[0]["nymex_price"] + curve.iloc[0]["basis"]
+# front_month_commodity_per_therm = front_month_commodity_per_dth / 10.0
 # wacog_premium_per_therm = wacog_premium_dollars_per_therm(utility_key, front_month_commodity_per_therm)
-# wacog_premium_per_dth = wacog_premium_per_therm * 10
+# wacog_premium_per_dth = wacog_premium_per_therm * 10 if wacog_premium_per_therm is not None else None
+# utility_comparison_available = wacog_premium_per_dth is not None
 
 # # ---------------------------------------------------------------------------
 # # Daily engagement: day-over-day price change + a curve-shape "Buyer Signal"
-# # -- the reason a buyer has to check back tomorrow, not just today.
-# # (Percentage-based, so unit-invariant -- no Dth conversion needed here.)
 # # ---------------------------------------------------------------------------
-# front_nymex_raw = float(curve.iloc[0]["nymex_price"])   # $/MMBtu ~= $/Dth
-# front_basis_raw = float(curve.iloc[0]["basis"])          # $/MMBtu ~= $/Dth
+# front_nymex_raw = float(curve.iloc[0]["nymex_price"])
+# front_basis_raw = float(curve.iloc[0]["basis"])
 # prior_close = record_and_get_prior_close(ticker, front_nymex_raw, front_basis_raw)
 
 # nymex_change = front_nymex_raw - prior_close["nymex"] if prior_close else None
 # basis_change = front_basis_raw - prior_close["basis"] if prior_close else None
 
-# front_month_commodity_per_dth = front_nymex_raw + front_basis_raw
 # next12 = curve.iloc[1:13]
 # if len(next12) >= 3:
 #     forward_avg_commodity = (next12["nymex_price"] + next12["basis"]).mean()
@@ -778,28 +909,16 @@ st.caption(
 #     signal_text = "Not enough forward months in the feed to compute a signal."
 
 # # ---------------------------------------------------------------------------
-# # Build the full forward curve stack (for charts / context), fully in $/Dth.
-# # NYMEX and Basis are used as-is (already $/MMBtu ~= $/Dth, no conversion).
-# # Transportation, Local Delivery and the WACOG premium come from $/therm-
-# # native tariff functions, so each is converted (x10) at the point of use.
+# # Build the forward curve stack -- NYMEX + Basis only, plus the utility's
+# # unbundled (commodity-only) comparison line where we have real data for it.
 # # ---------------------------------------------------------------------------
 # rows = []
 # for _, r in curve.iterrows():
 #     contract_date = pd.Timestamp(r["contract_date"])
-#     season = season_for_month(contract_date.month)
-
 #     nymex_per_dth = r["nymex_price"]
 #     basis_per_dth = r["basis"]
-#     market_commodity_per_dth = nymex_per_dth + basis_per_dth
-#     projected_utility_commodity_per_dth = market_commodity_per_dth + wacog_premium_per_dth
-
-#     if utility_key == "SoCalGas":
-#         transport_per_dth = (bracketed_cost(monthly_therms, SOCALGAS_CORE_G10.transport_only_tiers) / 100.0 / monthly_therms) * 10
-#     else:
-#         transport_per_dth = (pge_transport_only_cost(monthly_therms, PGE_GNR1, season) / monthly_therms) * 10
-
-#     local_delivery_per_dth = local_delivery_dollars_per_therm(utility_key, monthly_therms) * 10
-#     utility_bundled_per_dth = projected_utility_commodity_per_dth + transport_per_dth + local_delivery_per_dth + taxes_per_dth
+#     total_per_dth = nymex_per_dth + basis_per_dth
+#     utility_unbundled_per_dth = (total_per_dth + wacog_premium_per_dth) if utility_comparison_available else None
 
 #     rows.append({
 #         "contract_month": r["contract_month"],
@@ -807,41 +926,27 @@ st.caption(
 #         "nymex_is_live": r["nymex_is_live"],
 #         "NYMEX": nymex_per_dth,
 #         "Basis": basis_per_dth,
-#         "Commodity": market_commodity_per_dth,
-#         "Transportation": transport_per_dth,
-#         "Local Delivery": local_delivery_per_dth,
-#         "Utility Bundled Cost": utility_bundled_per_dth,
+#         "Total": total_per_dth,
+#         "Utility Unbundled": utility_unbundled_per_dth,
 #     })
 
 # stack_df = pd.DataFrame(rows)
 
 # # ---------------------------------------------------------------------------
-# # THE INDICATIVE FIXED PRICE -- averaged over the selected term. All figures
-# # from here on are $/Dth.
-# #
-# # Core Price (transparent, real, sourced) = avg NYMEX + avg Basis + real
-# # tariff Transportation over the term. Shown broken out, on purpose --
-# # these three are provable from public data.
-# #
-# # Local Delivery + Advisory Fee + Taxes (opaque, combined into ONE number) --
-# # these genuinely vary by account/meter/contract, so they are shown as a
-# # single estimate with an explicit "connect with RFP" flag rather than a
-# # false-precision breakout.
+# # THE INDICATIVE PRICE -- averaged over the selected term. $/Dth throughout.
 # # ---------------------------------------------------------------------------
 # term_window = stack_df.head(fixed_term_months)
 # avg_nymex = term_window["NYMEX"].mean()
 # avg_basis = term_window["Basis"].mean()
-# avg_transport = term_window["Transportation"].mean()
-# avg_local_delivery = term_window["Local Delivery"].mean()
-# avg_utility_bundled = term_window["Utility Bundled Cost"].mean()
+# total_price = avg_nymex + avg_basis
 
-# core_price = avg_nymex + avg_basis + avg_transport
-# opaque_bucket = avg_local_delivery + advisory_fee_per_dth + taxes_per_dth
-# total_fixed_price = core_price + opaque_bucket
-
-# savings_per_dth = avg_utility_bundled - total_fixed_price
-# savings_pct = (savings_per_dth / avg_utility_bundled * 100) if avg_utility_bundled else 0
-# annual_savings = savings_per_dth * monthly_dth * 12
+# if utility_comparison_available:
+#     avg_utility_unbundled = term_window["Utility Unbundled"].mean()
+#     savings_per_dth = avg_utility_unbundled - total_price
+#     savings_pct = (savings_per_dth / avg_utility_unbundled * 100) if avg_utility_unbundled else 0
+#     annual_savings = savings_per_dth * monthly_dth * 12
+# else:
+#     avg_utility_unbundled = savings_per_dth = savings_pct = annual_savings = None
 
 # # ---------------------------------------------------------------------------
 # # Live data strip
@@ -888,71 +993,59 @@ st.caption(
 # st.markdown("<br>", unsafe_allow_html=True)
 
 # # ---------------------------------------------------------------------------
-# # THE INDICATIVE FIXED PRICE BUILD -- the core conversion moment
+# # THE PRICE BUILD -- NYMEX + Basis = Total. That's the whole calculation.
 # # ---------------------------------------------------------------------------
-# st.subheader(f"Your {fixed_term_months}-Month Indicative Fixed Price — {utility_key}")
-# st.caption("All figures below are in **\\$/Dth** (1 Dth ≈ 1 MMBtu ≈ 10 therms) for consistency across the whole calculator.")
+# st.subheader(f"Your {fixed_term_months}-Month Price — {utility_key}")
+# st.caption("All figures in \\$/Dth (1 Dth ≈ 1 MMBtu ≈ 10 therms).")
 
-# b1, b2, b3, b4 = st.columns(4)
+# b1, b2, b3 = st.columns(3)
 # b1.markdown(f"""<div class="rfp-card"><div class="rfp-stat">${avg_nymex:.3f}<span style="font-size:1rem;">/Dth</span></div>
 # <div class="rfp-stat-label">NYMEX (avg, {fixed_term_months}-mo)</div></div>""", unsafe_allow_html=True)
 # b2.markdown(f"""<div class="rfp-card plus"><div class="rfp-stat">${avg_basis:+.3f}<span style="font-size:1rem;">/Dth</span></div>
 # <div class="rfp-stat-label">+ Basis (avg, {fixed_term_months}-mo)</div></div>""", unsafe_allow_html=True)
-# b3.markdown(f"""<div class="rfp-card plus"><div class="rfp-stat">${avg_transport:.3f}<span style="font-size:1rem;">/Dth</span></div>
-# <div class="rfp-stat-label">+ Transportation (tariff)</div></div>""", unsafe_allow_html=True)
-# b4.markdown(f"""<div class="rfp-card plus" style="border-left-color:{GOLD};"><div class="rfp-stat" style="color:{GOLD};">${core_price:.3f}<span style="font-size:1rem;">/Dth</span></div>
-# <div class="rfp-stat-label">= Core Price</div></div>""", unsafe_allow_html=True)
+# b3.markdown(f"""<div class="rfp-card total"><div class="rfp-stat" style="color:{GOLD};">${total_price:.3f}<span style="font-size:1rem;">/Dth</span></div>
+# <div class="rfp-stat-label">= Total</div></div>""", unsafe_allow_html=True)
 
-# st.markdown(f"""<div class="rfp-card opaque">
-# <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-#     <div>
-#         <div class="rfp-stat" style="color:{ORANGE};">≈ ${opaque_bucket:.3f}<span style="font-size:1rem;">/Dth (estimated)</span></div>
-#         <div class="rfp-stat-label">+ Local Delivery, Advisory &amp; Taxes</div>
+# if utility_comparison_available:
+#     st.markdown(f"""<div class="rfp-card">
+#     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
+#         <div>
+#             <div class="rfp-stat" style="color:{GREEN if savings_per_dth>=0 else RED};">${savings_per_dth:+.3f}/Dth</div>
+#             <div class="rfp-stat-label">vs. {utility_key}'s unbundled commodity rate (${avg_utility_unbundled:.3f}/Dth)</div>
+#         </div>
+#         <div>
+#             <div class="rfp-stat" style="color:{GREEN if annual_savings>=0 else RED};">${annual_savings:,.0f}</div>
+#             <div class="rfp-stat-label">Estimated annual $ impact at {monthly_dth:,} Dth/mo</div>
+#         </div>
 #     </div>
-#     <div style="max-width:480px; color:{TEXT}; font-size:0.88rem;">
-#         ⚠️ <b>This is an estimate.</b> Your actual Local Delivery, Advisory &amp; Taxes depend on your specific
-#         meter, volume tier, and contract terms — this is exactly why RFP shows this as one combined number
-#         instead of a false-precision breakdown. <b>Connect with RFP for your exact, guaranteed rate.</b>
-#     </div>
-# </div>
-# </div>""", unsafe_allow_html=True)
-
-# st.markdown(f"""<div class="rfp-card total">
-# <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
-#     <div>
-#         <div class="rfp-stat" style="font-size:2.3rem;">${total_fixed_price:.3f}<span style="font-size:1.1rem;">/Dth</span></div>
-#         <div class="rfp-stat-label">= Your {fixed_term_months}-Month Indicative Fixed Price</div>
-#     </div>
-#     <div>
-#         <div class="rfp-stat" style="color:{GREEN if savings_per_dth>=0 else RED}; font-size:2.3rem;">${savings_per_dth:+.3f}/Dth</div>
-#         <div class="rfp-stat-label">vs. {utility_key} projected bundled rate (${avg_utility_bundled:.3f}/Dth)</div>
-#     </div>
-#     <div>
-#         <div class="rfp-stat" style="color:{GREEN if annual_savings>=0 else RED}; font-size:2.3rem;">${annual_savings:,.0f}</div>
-#         <div class="rfp-stat-label">Estimated annual $ impact at {monthly_dth:,} Dth/mo</div>
-#     </div>
-# </div>
-# </div>""", unsafe_allow_html=True)
+#     </div>""", unsafe_allow_html=True)
+# else:
+#     st.markdown(f"""<div class="rfp-pending">
+#     <b>⏳ {utility_key} utility comparison coming soon.</b> {utility_key}'s commodity rate is published across
+#     several rate-class-specific schedules with a separately-adjusting monthly cost-of-gas charge, rather than
+#     one clean headline figure like SoCalGas and PG&E publish — we're sourcing a confirmed number before
+#     showing a comparison here rather than estimating one. NYMEX + Basis above is real and live either way.
+#     </div>""", unsafe_allow_html=True)
 
 # st.markdown(
 #     f"""
 #     <div class="rfp-cta-banner">
-#         <b>This is an indicative price, not a quote.</b> The Core Price above is built from real, live market
-#         data — but the final number depends on details only RFP can confirm for your account. Get your real,
-#         guaranteed {fixed_term_months}-month fixed price below.
+#         <b>This is NYMEX + Basis only — the market-based part of your price.</b> Transportation, local
+#         delivery, and everything else is different for every account, which is exactly why RFP doesn't
+#         guess at it here. Connect with RFP for your real, live {fixed_term_months}-month quote.
 #     </div>
 #     """,
 #     unsafe_allow_html=True,
 # )
 
-# with st.expander("📩 Get my real, guaranteed quote from RFP", expanded=False):
+# with st.expander("📩 Get my real, live quote from RFP", expanded=False):
 #     st.markdown(f"""
 #     **Already carrying forward what you've entered:** {utility_key}, {monthly_dth:,} Dth/mo,
 #     {fixed_term_months}-month term — RFP gets a qualified, usage-sized lead, not just an email address.
 
 #     **What you'll get weekly, by email:**
-#     - Your indicative fixed price, recalculated for your citygate and usage
-#     - Front-month basis for both SoCal Citygate and PG&E Citygate
+#     - Your indicative price, recalculated for your citygate and usage
+#     - Front-month basis for SoCal Citygate, PG&E Citygate, and Transco Zone 5
 #     - A short note on what actually moved the basis that week
 #     - RFP's daily market newsletter
 #     """)
@@ -963,10 +1056,6 @@ st.caption(
 #         newsletter_optin = st.checkbox("Also send me RFP's daily market newsletter", value=True)
 #         submitted = st.form_submit_button("Request my real quote")
 #         if submitted:
-#             # In production: post name/email/company/newsletter_optin PLUS the already-selected
-#             # utility_key, monthly_dth, fixed_term_months, and total_fixed_price to the
-#             # systeme.io funnel, so the weekly email can be personalized without asking the
-#             # lead to re-enter anything.
 #             st.success(f"Thanks {name or 'there'} — in production this posts to the systeme.io funnel "
 #                        f"with your {utility_key} / {monthly_dth:,} Dth/mo details attached, and "
 #                        f"triggers the nurture sequence + a booked-meeting link.")
@@ -977,7 +1066,7 @@ st.caption(
 # # Forward Strips -- mirrors RFP's own "One Minute Energy Update" format
 # # ---------------------------------------------------------------------------
 # st.subheader("Forward Strips")
-# st.caption(f"{TICKER_LABELS.get(ticker, ticker)} all-in ($/Dth) — commodity (NYMEX + basis) only, same format as RFP's daily market update.")
+# st.caption(f"{TICKER_LABELS.get(ticker, ticker)} all-in ($/Dth) — NYMEX + basis, same format as RFP's daily market update.")
 
 # stack_df["cal_year"] = stack_df["contract_date"].dt.year
 # stack_df["cal_month"] = stack_df["contract_date"].dt.month
@@ -994,7 +1083,7 @@ st.caption(
 #     ("Next Summer (Apr–Oct)", summer_next12),
 # ]
 # for col, (label, sub_df) in zip(strip_cols, strip_defs):
-#     val = sub_df["Commodity"].mean() if not sub_df.empty else None
+#     val = sub_df["Total"].mean() if not sub_df.empty else None
 #     col.markdown(f"""<div class="rfp-card"><div class="rfp-stat" style="font-size:1.4rem;">{f'${val:.2f}' if val else '—'}</div>
 #     <div class="rfp-stat-label">{label}</div></div>""", unsafe_allow_html=True)
 
@@ -1003,124 +1092,96 @@ st.caption(
 #     st.write("**Calendar Year Averages**")
 #     cy_cols = st.columns(len(cal_years))
 #     for col, yr in zip(cy_cols, cal_years):
-#         yr_avg = stack_df[stack_df["cal_year"] == yr]["Commodity"].mean()
+#         yr_avg = stack_df[stack_df["cal_year"] == yr]["Total"].mean()
 #         col.markdown(f"""<div class="rfp-card"><div class="rfp-stat" style="font-size:1.3rem;">${yr_avg:.2f}</div>
 #         <div class="rfp-stat-label">Calendar {yr}</div></div>""", unsafe_allow_html=True)
 
 # st.markdown("<br>", unsafe_allow_html=True)
 
 # # ---------------------------------------------------------------------------
-# # Fixed vs. Utility, across the curve
+# # Your Price vs. Utility -- the chart that sells it
 # # ---------------------------------------------------------------------------
-# st.subheader(f"Your Fixed Price vs. {utility_key} — What The Utility Can't Offer")
-# fig_structures = go.Figure()
-# fig_structures.add_trace(go.Scatter(
-#     x=stack_df["contract_month"], y=[total_fixed_price] * len(stack_df),
-#     name=f"Your {fixed_term_months}-Month Fixed Price", mode="lines", line=dict(color=GOLD, width=3, dash="dash"),
-# ))
-# fig_structures.add_trace(go.Scatter(
-#     x=stack_df["contract_month"], y=stack_df["Utility Bundled Cost"],
-#     name=f"{utility_key} Bundled Rate (variable)", mode="lines+markers", line=dict(color=RED, width=2, dash="dot"),
-# ))
-# fig_structures.update_layout(**dark_chart_layout(
-#     height=420, yaxis=dict(title=dict(text="$ per Dth")),
-#     legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40, b=20),
-# ))
-# st.plotly_chart(fig_structures, use_container_width=True)
-# st.caption(
-#     f"The utility's rate is variable by regulatory design — it resets monthly with the market. Your "
-#     f"{fixed_term_months}-month fixed price is locked using today's forward curve. This is a real, "
-#     f"CPUC-documented category — competing CTAs already sell Fixed products in this exact market "
-#     f"(e.g. Spark Energy, XOOM Energy, Symmetry Energy on SoCalGas's own CTA cost-comparison tool)."
-# )
+# if utility_comparison_available:
+#     st.subheader(f"Your Price vs. {utility_key} — What The Utility Can't Offer")
+#     fig_structures = go.Figure()
+#     fig_structures.add_trace(go.Scatter(
+#         x=stack_df["contract_month"], y=[total_price] * len(stack_df),
+#         name=f"Your {fixed_term_months}-Month Price", mode="lines", line=dict(color=GOLD, width=3, dash="dash"),
+#     ))
+#     fig_structures.add_trace(go.Scatter(
+#         x=stack_df["contract_month"], y=stack_df["Utility Unbundled"],
+#         name=f"{utility_key} Unbundled Rate (variable)", mode="lines+markers", line=dict(color=RED, width=2, dash="dot"),
+#     ))
+#     fig_structures.update_layout(**dark_chart_layout(
+#         height=420, yaxis=dict(title=dict(text="$ per Dth")),
+#         legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40, b=20),
+#     ))
+#     st.plotly_chart(fig_structures, use_container_width=True)
+#     st.caption(
+#         f"The utility's rate is variable by regulatory design — it resets monthly with the market. Your "
+#         f"{fixed_term_months}-month price is locked using today's forward curve. Both lines are commodity-only "
+#         f"(unbundled) — transportation and delivery are excluded from both sides for a fair comparison, since "
+#         f"those apply the same way regardless of who supplies your gas."
+#     )
 
-# # ---------------------------------------------------------------------------
-# # Layer breakdown + pie -- 4 layers now: Core Price components + one opaque bucket
-# # ---------------------------------------------------------------------------
-# layers = ["NYMEX", "Basis", "Transportation", "Local Delivery, Advisory & Taxes"]
-# colors = ["#4FC3F7", GOLD, GREEN, ORANGE]
-
-# chart_df = stack_df.copy()
-# chart_df["Local Delivery, Advisory & Taxes"] = chart_df["Local Delivery"] + advisory_fee_per_dth + taxes_per_dth
-
-# fig = go.Figure()
-# for layer, color in zip(layers, colors):
+#     st.subheader("NYMEX + Basis — Layer by Layer")
+#     layers = ["NYMEX", "Basis"]
+#     colors = ["#4FC3F7", GOLD]
+#     fig = go.Figure()
+#     for layer, color in zip(layers, colors):
+#         fig.add_trace(go.Scatter(
+#             x=stack_df["contract_month"], y=stack_df[layer], name=layer, mode="lines",
+#             stackgroup="one", line=dict(width=0.5, color=color), fillcolor=color,
+#         ))
 #     fig.add_trace(go.Scatter(
-#         x=chart_df["contract_month"], y=chart_df[layer], name=layer, mode="lines",
-#         stackgroup="one", line=dict(width=0.5, color=color), fillcolor=color,
+#         x=stack_df["contract_month"], y=stack_df["Utility Unbundled"],
+#         name=f"{utility_key} Unbundled Rate", mode="lines+markers", line=dict(color=RED, width=3, dash="dot"),
 #     ))
-# fig.add_trace(go.Scatter(
-#     x=chart_df["contract_month"], y=chart_df["Utility Bundled Cost"],
-#     name=f"{utility_key} Bundled Rate", mode="lines+markers", line=dict(color=RED, width=3, dash="dot"),
-# ))
-# fig.update_layout(**dark_chart_layout(
-#     height=440, yaxis=dict(title=dict(text="$ per Dth")),
-#     legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40, b=20),
-# ))
-# st.plotly_chart(fig, use_container_width=True)
-# st.caption(
-#     "Stacked area = the real, transparent Core Price components plus the estimated combined Local "
-#     f"Delivery/Advisory/Taxes bucket, for every forward month. The dotted red line is {utility_key}'s "
-#     "rate, projected forward with the market plus the measured WACOG premium (see Data Sources tab)."
-# )
-
-# pie_col, table_col = st.columns([1, 1.3])
-# with pie_col:
-#     st.subheader("Where the Money Goes")
-#     avg_layers = chart_df[layers].mean()
-#     fig_pie = go.Figure(go.Pie(
-#         labels=layers, values=avg_layers.values, hole=0.45,
-#         marker=dict(colors=colors, line=dict(color=NAVY, width=2)),
-#         textinfo="label+percent", textfont=dict(color=NAVY, size=12),
+#     fig.update_layout(**dark_chart_layout(
+#         height=400, yaxis=dict(title=dict(text="$ per Dth")),
+#         legend=dict(orientation="h", yanchor="bottom", y=1.02), margin=dict(t=40, b=20),
 #     ))
-#     fig_pie.update_layout(**dark_chart_layout(height=380, showlegend=False, margin=dict(t=10, b=10)))
-#     st.plotly_chart(fig_pie, use_container_width=True)
-#     st.caption("Average share of the delivered cost across the forward curve at this usage level. The orange "
-#                "slice is the one number RFP can't finalize until you connect.")
+#     st.plotly_chart(fig, use_container_width=True)
 
-# with table_col:
-#     st.subheader("Next 3 Months — NYMEX & Basis")
-#     quote_time_str = dt.datetime.fromisoformat(nymex_fetched_at).strftime("%b %d, %Y %H:%M UTC") if nymex_fetched_at else "n/a"
-#     st.caption(f"NYMEX quotes as of {quote_time_str} · basis as of report date {basis_result['as_of']}")
-#     next3_cols = st.columns(3)
-#     for i in range(min(3, len(stack_df))):
-#         row = stack_df.iloc[i]
-#         combined = row["NYMEX"] + row["Basis"]
-#         live_tag = "🟢" if row["nymex_is_live"] else "🟡"
-#         with next3_cols[i]:
-#             st.markdown(f"""<div class="rfp-card">
-#                 <div style="color:{SUBTEXT}; font-size:0.85rem;">{row['contract_month']} {live_tag}</div>
-#                 <div class="rfp-stat" style="font-size:1.3rem;">${combined:.2f}<span style="font-size:0.85rem; color:{SUBTEXT} !important;">/Dth</span></div>
-#                 <div class="rfp-stat-label">NYMEX ${row['NYMEX']:.2f} + Basis ${row['Basis']:+.2f}</div>
-#             </div>""", unsafe_allow_html=True)
+# # ---------------------------------------------------------------------------
+# # Next 3 Months
+# # ---------------------------------------------------------------------------
+# st.subheader("Next 3 Months — NYMEX & Basis")
+# quote_time_str = dt.datetime.fromisoformat(nymex_fetched_at).strftime("%b %d, %Y %H:%M UTC") if nymex_fetched_at else "n/a"
+# st.caption(f"NYMEX quotes as of {quote_time_str} · basis as of report date {basis_result['as_of']}")
+# next3_cols = st.columns(3)
+# for i in range(min(3, len(stack_df))):
+#     row = stack_df.iloc[i]
+#     live_tag = "🟢" if row["nymex_is_live"] else "🟡"
+#     with next3_cols[i]:
+#         st.markdown(f"""<div class="rfp-card">
+#             <div style="color:{SUBTEXT}; font-size:0.85rem;">{row['contract_month']} {live_tag}</div>
+#             <div class="rfp-stat" style="font-size:1.3rem;">${row['Total']:.2f}<span style="font-size:0.85rem; color:{SUBTEXT} !important;">/Dth</span></div>
+#             <div class="rfp-stat-label">NYMEX ${row['NYMEX']:.2f} + Basis ${row['Basis']:+.2f}</div>
+#         </div>""", unsafe_allow_html=True)
 
 # st.markdown("---")
 
 # # ---------------------------------------------------------------------------
-# # Tariff transparency + data sources
+# # Data + tariff transparency
 # # ---------------------------------------------------------------------------
 # st.header("The Real Data Behind This Calculator")
 
-# tab1, tab2, tab3 = st.tabs(["Forward Curve Detail", f"{utility_key} Tariff", "Data Sources"])
+# tab1, tab2, tab3 = st.tabs(["Forward Curve Detail", f"{utility_key} Tariff Reference", "Data Sources"])
 
 # with tab1:
-#     display_df = chart_df[["contract_month", "NYMEX", "Basis", "Transportation",
-#                             "Local Delivery, Advisory & Taxes", "Utility Bundled Cost"]].copy()
+#     display_cols = ["contract_month", "NYMEX", "Basis", "Total"] + (["Utility Unbundled"] if utility_comparison_available else [])
+#     display_df = stack_df[display_cols].copy()
 #     for col in display_df.columns[1:]:
 #         display_df[col] = display_df[col].map(lambda v: f"${v:.3f}")
 #     st.dataframe(display_df, hide_index=True, use_container_width=True)
-#     st.caption(
-#         f"All figures \\$/Dth. Your {fixed_term_months}-month Core Price averages the NYMEX + Basis + "
-#         f"Transportation columns above over the first {fixed_term_months} rows: \\${core_price:.3f}/Dth. "
-#         f"Add the estimated Local Delivery, Advisory & Taxes bucket (\\${opaque_bucket:.3f}/Dth) for the "
-#         f"full indicative total of \\${total_fixed_price:.3f}/Dth."
-#     )
 
 # with tab2:
 #     st.caption(
-#         "⚠️ The tables below are shown in the utility's own **native \\$/therm units**, exactly as published "
-#         "in their tariff sheets — deliberately NOT converted to Dth, so you can check these numbers directly "
-#         "against the source document. Everywhere else in this calculator uses \\$/Dth (1 Dth ≈ 10 therms)."
+#         "Shown for context and credibility — RFP knows these real, published rates, but they aren't used "
+#         "in the Total above, since Transportation and Local Delivery are different for every account. "
+#         "Figures below are the utility's own **native $/therm units**, exactly as published in their tariff "
+#         "sheets, deliberately not converted to Dth."
 #     )
 #     if utility_key == "SoCalGas":
 #         df_t = pd.DataFrame([{"Tier": t.label, "Bundled Core Rate (¢/therm)": t.rate_cents_per_therm}
@@ -1132,19 +1193,25 @@ st.caption(
 #         cc1.dataframe(df_t, hide_index=True, use_container_width=True)
 #         cc2.write("**Transport-only (Schedule G-10, GT-10 / CAT)**")
 #         cc2.dataframe(df_tr, hide_index=True, use_container_width=True)
-#         st.caption(f"Local Delivery: 49.315¢/meter/day flat customer charge. "
-#                    f"Source: {SOCALGAS_CORE_G10.source_note}, effective {SOCALGAS_CORE_G10.effective_date}. "
+#         st.caption(f"Source: {SOCALGAS_CORE_G10.source_note}, effective {SOCALGAS_CORE_G10.effective_date}. "
 #                    f"[{SOCALGAS_CORE_G10.source_url}]({SOCALGAS_CORE_G10.source_url})")
-#     else:
+#     elif utility_key == "PG&E":
 #         df_p = pd.DataFrame([
 #             {"Band": "First 4,000 therms/mo", "Summer ($/therm)": PGE_GNR1.transport_summer_first4000, "Winter ($/therm)": PGE_GNR1.transport_winter_first4000},
 #             {"Band": "Excess over 4,000 therms/mo", "Summer ($/therm)": PGE_GNR1.transport_summer_excess, "Winter ($/therm)": PGE_GNR1.transport_winter_excess},
 #         ])
 #         st.write(f"**Transportation — Procurement: ${PGE_GNR1.procurement_dollars_per_therm:.5f}/therm**")
 #         st.dataframe(df_p, hide_index=True, use_container_width=True)
-#         st.caption(f"Local Delivery: tiered daily customer charge by Average Daily Usage (ADU). "
-#                    f"Source: {PGE_GNR1.source_note}, effective {PGE_GNR1.effective_date}. "
+#         st.caption(f"Source: {PGE_GNR1.source_note}, effective {PGE_GNR1.effective_date}. "
 #                    f"[{PGE_GNR1.source_url}]({PGE_GNR1.source_url})")
+#     else:
+#         st.info(
+#             "Piedmont's tariff reference is still being sourced. Their rate structure splits Transportation, "
+#             "Local Delivery, and Cost of Gas across multiple rate-class-specific schedules (Fg-3, Ag-1, Ig-4, "
+#             "Pg-10, and others) with a separately-adjusting monthly PGA, rather than one clean published "
+#             "figure per component the way SoCalGas and PG&E disclose theirs — this tab will populate once "
+#             "that's confirmed."
+#         )
 
 # with tab3:
 #     st.markdown(f"""
@@ -1153,37 +1220,15 @@ st.caption(
 #       Treated as \\$/Dth (1 Dth ≈ 1 MMBtu, the native unit of the feed).
 #     - **Forward basis**: [Rogue Basis Scraper feed]({LIVE_BASIS_URL}), ticker `{ticker}`
 #       ({TICKER_LABELS.get(ticker, ticker)}), as of report date {basis_result['as_of']}. Also \\$/Dth-native.
-#     - **Transportation**: {utility_key}'s own published tariff (\\$/therm-native — see the tab above),
-#       converted to \\$/Dth (×10) here for consistency with the rest of the calculator.
-#     - **Core Price** = avg NYMEX + avg Basis + Transportation, averaged over your selected
-#       {fixed_term_months}-month term. Every input here is public, sourced data.
-#     - **Local Delivery**: {utility_key}'s own published fixed customer/meter charge (real, tariff-sourced,
-#       \\$/therm-native, converted to \\$/Dth) — combined into the opaque bucket below rather than broken out
-#       on its own, since it's shown alongside the Advisory Fee and Taxes as one number.
-#     - **Advisory Fee**: RFP's fee, adjustable above (default \\${ADVISORY_FEE_DEFAULT_PER_DTH:.2f}/Dth) — covers
-#       procurement strategy, market intelligence, and the senior-level relationship. This is where RFP's
-#       real, per-account pricing comes in, which is exactly why it isn't finalized on a public page.
-#     - **Taxes & Regulatory Fees**: adjustable above (default \\${TAXES_DEFAULT_PER_DTH:.2f}/Dth) — varies
-#       by exact jurisdiction and account specifics.
-#     - **Utility Bundled Cost (projected)**: forward market commodity (NYMEX+basis) + a WACOG premium of
-#       \\${wacog_premium_per_dth:+.2f}/Dth, measured from the gap between {utility_key}'s current published Cost of
-#       Gas and today's market commodity price. {utility_key}'s own tariff (Schedule G-CP) states this Cost of
-#       Gas figure already includes storage carrying costs, CPGA true-up adjustments, and Gas Cost Incentive
-#       Mechanism (GCIM) adjustments — i.e. it runs structurally above pure forward-market pricing, which is
-#       why the premium is projected forward rather than assuming a flat utility rate.
-#     - **Fixed pricing**: the utility's own default rate is explicitly variable, resetting monthly with the
-#       market by regulatory design (SoCalGas/PG&E's "Price to Compare"). Only CTAs/marketers can offer Fixed —
-#       confirmed via the CPUC's own CTA Cost Comparison tool, which shows real competitors (Spark Energy Gas,
-#       XOOM Energy, Symmetry Energy, Pacific Summit Energy) already selling Fixed-rate products in this exact
-#       market, typically with 12–24 month terms and early termination fees (\\$100–\\$400 in the disclosed
-#       examples). This prototype does not yet include an early termination fee in the estimate — add one
-#       before using this in a real customer-facing quote.
+#     - **Total** = NYMEX + Basis, averaged over your selected {fixed_term_months}-month term. That's the whole
+#       calculation — no Transportation, Local Delivery, or fees are included, since those genuinely differ by
+#       account and RFP would rather show nothing than guess.
+#     {"- **Utility Unbundled Rate**: " + utility_key + "'s own published commodity-only Cost of Gas, projected forward using the gap between their current rate and today's market price (a real, measured premium — not assumed). Both sides of the comparison exclude Transportation and Local Delivery, for a fair, apples-to-apples comparison of just the shoppable part of the bill." if utility_comparison_available else "- **" + utility_key + " utility comparison**: not yet available — see the Tariff Reference tab for why."}
 #     """)
 
 # st.markdown("---")
 # st.caption(
-#     "Prototype built for pitch purposes. Utility tariff data sourced directly from SoCalGas and PG&E "
-#     "published rate schedules. NYMEX and basis data are live where available, with clearly labeled cached "
-#     "fallbacks otherwise. This is an indicative price only — not a binding quote. Connect with RFP Energy "
-#     "Solutions for your real, guaranteed number."
+#     "Prototype built for pitch purposes. NYMEX and basis data are live where available, with clearly labeled "
+#     "cached fallbacks otherwise. This is indicative only — not a binding quote. Connect with RFP Energy "
+#     "Solutions for your real, live number."
 # )
