@@ -1,0 +1,42 @@
+{
+  "generated_at": "2026-10-31T15:02:12.494932+00:00",
+  "basis_report_date": "2026-10-27",
+  "tickers": {
+    "SCB": {
+      "label": "SoCal Citygate",
+      "contract_month": "Nov26",
+      "nymex": 2.817,
+      "nymex_is_live": false,
+      "basis": 0.985,
+      "combined": 3.802,
+      "next12_vs_front_pct": 6.5,
+      "prior_nymex": 2.816999912261963,
+      "prior_basis": 0.985,
+      "prior_date": "2026-10-30"
+    },
+    "PGE": {
+      "label": "PG&E Citygate",
+      "contract_month": "Nov26",
+      "nymex": 2.817,
+      "nymex_is_live": false,
+      "basis": 0.875,
+      "combined": 3.692,
+      "next12_vs_front_pct": -16.1,
+      "prior_nymex": 2.816999912261963,
+      "prior_basis": 0.875,
+      "prior_date": "2026-10-30"
+    },
+    "DKR": {
+      "label": "Transco Zone 5",
+      "contract_month": "Nov26",
+      "nymex": 2.817,
+      "nymex_is_live": false,
+      "basis": -0.318,
+      "combined": 2.499,
+      "next12_vs_front_pct": 55.4,
+      "prior_nymex": 2.816999912261963,
+      "prior_basis": -0.3175,
+      "prior_date": "2026-10-30"
+    }
+  }
+}
