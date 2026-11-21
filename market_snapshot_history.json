@@ -1,0 +1,44 @@
+{
+  "SCB": {
+    "today": {
+      "date": "2026-11-21",
+      "contract_month": "Dec26",
+      "nymex": 3.4110000133514404,
+      "basis": 0.9075
+    },
+    "prior": {
+      "date": "2026-11-20",
+      "contract_month": "Dec26",
+      "nymex": 3.4660000801086426,
+      "basis": 0.9075
+    }
+  },
+  "PGE": {
+    "today": {
+      "date": "2026-11-21",
+      "contract_month": "Dec26",
+      "nymex": 3.4110000133514404,
+      "basis": 0.25
+    },
+    "prior": {
+      "date": "2026-11-20",
+      "contract_month": "Dec26",
+      "nymex": 3.4660000801086426,
+      "basis": 0.25
+    }
+  },
+  "DKR": {
+    "today": {
+      "date": "2026-11-21",
+      "contract_month": "Dec26",
+      "nymex": 3.4110000133514404,
+      "basis": 1.3125
+    },
+    "prior": {
+      "date": "2026-11-20",
+      "contract_month": "Dec26",
+      "nymex": 3.4660000801086426,
+      "basis": 1.3125
+    }
+  }
+}
